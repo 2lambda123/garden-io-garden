@@ -62,6 +62,7 @@ describe("kubernetes container deployment handlers", () => {
   let ctx: KubernetesPluginContext
   let provider: KubernetesProvider
   let api: KubeApi
+  let deploymentRegistry: string | undefined
 
   async function resolveDeployAction(name: string, mode: ActionMode = "default") {
     if (mode !== "default") {
@@ -88,6 +89,9 @@ describe("kubernetes container deployment handlers", () => {
       await garden.getPluginContext({ provider, templateContext: undefined, events: undefined })
     )
     api = await KubeApi.factory(garden.log, ctx, provider)
+    deploymentRegistry = provider.config.deploymentRegistry
+      ? `${provider.config.deploymentRegistry.hostname}/${provider.config.deploymentRegistry.namespace}`
+      : undefined
   }
 
   describe("createContainerManifests", () => {
@@ -646,6 +650,7 @@ describe("kubernetes container deployment handlers", () => {
   })
 
   describe("k8sContainerDeploy", () => {
+    let action: ResolvedDeployAction
     context("local mode", () => {
       before(async () => {
         await init("local")
@@ -657,9 +662,17 @@ describe("kubernetes container deployment handlers", () => {
         }
       })
 
-      it("should deploy a simple Deploy", async () => {
-        const action = await resolveDeployAction("simple-service")
+      beforeEach(async () => {
+        action = await resolveDeployAction("simple-service")
+      })
 
+      afterEach(async () => {
+        try {
+          await api.apps.deleteNamespacedDeployment(action.name, provider.config.namespace!.name)
+        } catch (err) {}
+      })
+
+      it("should deploy a simple Deploy", async () => {
         const deployTask = new DeployTask({
           garden,
           graph,
@@ -684,7 +697,6 @@ describe("kubernetes container deployment handlers", () => {
 
       it("should prune previously applied resources when deploying", async () => {
         const log = garden.log
-        const action = await resolveDeployAction("simple-service")
         const namespace = await getAppNamespace(ctx, log, provider)
 
         const mapToNotPruneKey = "should-not-be-pruned"
@@ -756,7 +768,6 @@ describe("kubernetes container deployment handlers", () => {
       })
 
       it("should ignore empty env vars in status check comparison", async () => {
-        const action = await resolveDeployAction("simple-service")
         action["_config"].spec.env = {
           FOO: "banana",
           BAR: "",
@@ -855,8 +866,8 @@ describe("kubernetes container deployment handlers", () => {
 
         // Note: the image version should match the build action version and not the
         // deploy action version
-        expect(resources.Deployment.spec.template.spec.containers[0].image).to.equal(
-          `europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/${action.name}:${buildVersionString}`
+        expect(resources.Deployment.spec.template.spec.containers[0].image).to.eql(
+          `${deploymentRegistry}/${action.name}:${buildVersionString}`
         )
       })
 
@@ -870,7 +881,7 @@ describe("kubernetes container deployment handlers", () => {
         // Note: the image version should match the build action version and not the
         // deploy action version
         expect(resources.Deployment.spec.template.spec.containers[0].image).to.equal(
-          `europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/${action.name}:${buildVersionString}`
+          `${deploymentRegistry}/${action.name}:${buildVersionString}`
         )
       })
 
@@ -884,7 +895,7 @@ describe("kubernetes container deployment handlers", () => {
         // Note: the image version should match the build action version and not the
         // deploy action version
         expect(resources.Deployment.spec.template.spec.containers[0].image).to.equal(
-          `europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/${action.name}:${buildVersionString}`
+          `${deploymentRegistry}/${action.name}:${buildVersionString}`
         )
       })
     })
@@ -893,6 +904,15 @@ describe("kubernetes container deployment handlers", () => {
   describe("handleChangedSelector", () => {
     before(async () => {
       await init("local")
+    })
+
+    let action: ResolvedDeployAction
+    beforeEach(async () => {
+      action = await resolveDeployAction("simple-service")
+      await cleanupSpecChangedSimpleService(action)
+    })
+    afterEach(async () => {
+      await cleanupSpecChangedSimpleService(action) // Clean up in case we're re-running the test case
     })
 
     after(async () => {
@@ -964,10 +984,8 @@ describe("kubernetes container deployment handlers", () => {
     }
 
     it("should delete resources if production = false", async () => {
-      const action = await resolveDeployAction("simple-service")
       const actionLog = createActionLog({ log: garden.log, actionName: action.name, actionKind: action.kind })
 
-      await cleanupSpecChangedSimpleService(action) // Clean up in case we're re-running the test case
       await deploySpecChangedSimpleService(action)
       expect(await simpleServiceIsRunning(action)).to.eql(true)
 
@@ -994,10 +1012,8 @@ describe("kubernetes container deployment handlers", () => {
     })
 
     it("should delete resources if production = true anad force = true", async () => {
-      const action = await resolveDeployAction("simple-service")
       const actionLog = createActionLog({ log: garden.log, actionName: action.name, actionKind: action.kind })
 
-      await cleanupSpecChangedSimpleService(action) // Clean up in case we're re-running the test case
       await deploySpecChangedSimpleService(action)
       expect(await simpleServiceIsRunning(action)).to.eql(true)
 
@@ -1024,8 +1040,6 @@ describe("kubernetes container deployment handlers", () => {
     })
 
     it("should not delete resources and throw an error if production = true anad force = false", async () => {
-      const action = await resolveDeployAction("simple-service")
-      await cleanupSpecChangedSimpleService(action) // Clean up in case we're re-running the test case
       await deploySpecChangedSimpleService(action)
       expect(await simpleServiceIsRunning(action)).to.eql(true)
       const actionLog = createActionLog({ log: garden.log, actionName: action.name, actionKind: action.kind })
@@ -1057,7 +1071,6 @@ describe("kubernetes container deployment handlers", () => {
       )
 
       expect(await simpleServiceIsRunning(action)).to.eql(true)
-      await cleanupSpecChangedSimpleService(action)
     })
   })
 })

@@ -19,9 +19,10 @@ import { ActionLog, createActionLog } from "../../../../../../../src/logger/log-
 import { ContainerBuildAction } from "../../../../../../../src/plugins/container/config"
 import { BuildTask } from "../../../../../../../src/tasks/build"
 import { k8sContainerBuildExtension } from "../../../../../../../src/plugins/kubernetes/container/extensions"
-import { deleteGoogleArtifactImage, listGoogleArtifactImageTags } from "../../../../../helpers"
+import { deleteGoogleArtifactImage, deleteNamespace, listGoogleArtifactImageTags } from "../../../../../helpers"
+import { KubeApi } from "../../../../../../../src/plugins/kubernetes/api"
 
-describe.skip("Kubernetes Container Build Extension", () => {
+describe("Kubernetes Container Build Extension", () => {
   const builder = k8sContainerBuildExtension()
 
   let garden: Garden
@@ -30,21 +31,27 @@ describe.skip("Kubernetes Container Build Extension", () => {
   let graph: ConfigGraph
   let provider: KubernetesProvider
   let ctx: PluginContext
-  let currentEnv: string
+  let deploymentRegistry: string | undefined
+  let api: KubeApi
 
   after(async () => {
-    if (garden) {
-      garden.close()
+    if (cleanup) {
+      cleanup()
+      await deleteNamespace(api, "container-default")
     }
   })
 
   const init = async (environmentName: string, remoteContainerAuth = false) => {
-    currentEnv = environmentName
     ;({ garden, cleanup } = await getContainerTestGarden(environmentName, { remoteContainerAuth }))
     log = createActionLog({ log: garden.log, actionName: "", actionKind: "" })
     graph = await garden.getConfigGraph({ log: garden.log, emit: false })
     provider = <KubernetesProvider>await garden.resolveProvider(garden.log, "local-kubernetes")
     ctx = await garden.getPluginContext({ provider, templateContext: undefined, events: undefined })
+    api = await KubeApi.factory(garden.log, ctx, provider)
+
+    deploymentRegistry = provider.config.deploymentRegistry
+      ? `${provider.config.deploymentRegistry.hostname}/${provider.config.deploymentRegistry.namespace}`
+      : undefined
   }
 
   async function executeBuild(buildActionName: string) {
@@ -80,12 +87,14 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
   grouped("remote-only").context("local-remote-registry mode", () => {
     const localImageName = "remote-registry-test"
-    const remoteImageName = `europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/${localImageName}`
+    let remoteImageName: string
 
     beforeEach(async () => {
       await init("local-remote-registry", true)
 
-      await deleteGoogleArtifactImage(localImageName)
+      remoteImageName = `${deploymentRegistry}/${localImageName}`
+
+      await deleteGoogleArtifactImage(remoteImageName)
       await containerHelpers.removeLocalImage(localImageName, log, ctx)
       await containerHelpers.removeLocalImage(remoteImageName, log, ctx)
     })
@@ -96,7 +105,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
         await containerHelpers.removeLocalImage(localImageName, log, ctx)
         await containerHelpers.removeLocalImage(remoteImageName, log, ctx)
-        await deleteGoogleArtifactImage(localImageName)
+        await deleteGoogleArtifactImage(remoteImageName)
       }
     })
 
@@ -116,7 +125,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
       const localNameExists = await containerHelpers.getLocalImageInfo(taggedLocalName, log, ctx)
       expect(localNameExists?.identifier).to.equal(taggedLocalName)
 
-      const remoteTags = await listGoogleArtifactImageTags(localImageName)
+      const remoteTags = await listGoogleArtifactImageTags(remoteImageName)
       expect(remoteTags).has.length(1)
       expect(remoteTags[0]).to.equal(tag)
     })
@@ -136,7 +145,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
       expect(resultReady.state).to.equal("ready")
 
-      await deleteGoogleArtifactImage(localImageName)
+      await deleteGoogleArtifactImage(remoteImageName)
 
       const resultNotReady = await builder.handlers.getStatus!({
         ctx,
@@ -159,7 +168,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
         expect(result.detail?.message).to.eql(`Published ${remoteImageName}:${action.versionString()}`)
 
-        const remoteTags = await listGoogleArtifactImageTags(localImageName)
+        const remoteTags = await listGoogleArtifactImageTags(remoteImageName)
         expect(remoteTags).has.length(1)
         expect(remoteTags[0]).to.equal(action.versionString())
       })
@@ -176,7 +185,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
         expect(result.detail?.message).to.eql(`Published ${remoteImageName}:foo`)
 
-        const remoteTags = await listGoogleArtifactImageTags(localImageName)
+        const remoteTags = await listGoogleArtifactImageTags(remoteImageName)
         expect(remoteTags).has.length(2)
         expect(remoteTags).to.have.members(["foo", action.versionString()])
       })
@@ -187,7 +196,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
     beforeEach(async () => {
       await init("kaniko-project-namespace", true)
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
     })
 
     afterEach(async () => {
@@ -195,13 +204,13 @@ describe.skip("Kubernetes Container Build Extension", () => {
         cleanup()
       }
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
     })
 
     it("should build a simple container", async () => {
       const action = await executeBuild("simple-service")
 
-      const remoteTags = await listGoogleArtifactImageTags("simple-service")
+      const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/simple-service`)
       expect(remoteTags).has.length(1)
       expect(remoteTags[0]).to.equal(action.versionString())
     })
@@ -217,7 +226,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
       expect(resultReady.state).to.equal("ready")
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
 
       const resultNotReady = await builder.handlers.getStatus!({
         ctx,
@@ -241,8 +250,8 @@ describe.skip("Kubernetes Container Build Extension", () => {
         cleanup()
       }
 
-      await deleteGoogleArtifactImage(localImageName)
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/${localImageName}`)
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
       await containerHelpers.removeLocalImage("simple-service", log, ctx)
       await containerHelpers.removeLocalImage(localImageName, log, ctx)
     })
@@ -250,7 +259,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
     it("should build and push to configured private deploymentRegistry", async () => {
       const action = await executeBuild(localImageName)
 
-      const remoteTags = await listGoogleArtifactImageTags(localImageName)
+      const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/${localImageName}`)
       expect(remoteTags).has.length(1)
       expect(remoteTags[0]).to.equal(action.versionString())
     })
@@ -310,11 +319,10 @@ describe.skip("Kubernetes Container Build Extension", () => {
         })
 
         expect(result.detail?.message).to.eql(
-          "Published europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/remote-registry-test:" +
-            action.versionString()
+          `Published ${deploymentRegistry}/remote-registry-test:` + action.versionString()
         )
 
-        const remoteTags = await listGoogleArtifactImageTags("remote-registry-test")
+        const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/remote-registry-test`)
         expect(remoteTags).has.length(1)
         expect(remoteTags[0]).to.equal(action.versionString())
       })
@@ -329,11 +337,9 @@ describe.skip("Kubernetes Container Build Extension", () => {
           tag: "foo",
         })
 
-        expect(result.detail?.message).to.eql(
-          "Published europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/remote-registry-test:foo"
-        )
+        expect(result.detail?.message).to.eql(`Published ${deploymentRegistry}/remote-registry-test:foo`)
 
-        const remoteTags = await listGoogleArtifactImageTags("remote-registry-test")
+        const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/remote-registry-test`)
         expect(remoteTags).has.length(2)
         expect(remoteTags).to.have.members(["foo", action.versionString()])
       })
@@ -350,13 +356,13 @@ describe.skip("Kubernetes Container Build Extension", () => {
         cleanup()
       }
 
-      await deleteGoogleArtifactImage("remote-registry-test")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/remote-registry-test`)
     })
 
     it("should push to configured deploymentRegistry if specified", async () => {
       const action = await executeBuild("remote-registry-test")
 
-      const remoteTags = await listGoogleArtifactImageTags("remote-registry-test")
+      const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/remote-registry-test`)
       expect(remoteTags).has.length(1)
       expect(remoteTags[0]).to.equal(action.versionString())
     })
@@ -373,14 +379,14 @@ describe.skip("Kubernetes Container Build Extension", () => {
         cleanup()
       }
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
       await containerHelpers.removeLocalImage("simple-service", log, ctx)
     })
 
     it("should build and push a simple container", async () => {
       const action = await executeBuild("simple-service")
 
-      const remoteTags = await listGoogleArtifactImageTags("simple-service")
+      const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/simple-service`)
       expect(remoteTags).has.length(2)
       expect(remoteTags).to.have.members([action.versionString(), "_buildcache"])
     })
@@ -396,7 +402,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
       expect(resultReady.state).to.equal("ready")
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
 
       const resultNotExists = await builder.handlers.getStatus!({
         ctx,
@@ -441,13 +447,9 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
     context("publish handler", () => {
       afterEach(async () => {
-        await deleteGoogleArtifactImage("remote-registry-test")
+        await deleteGoogleArtifactImage(`${deploymentRegistry}/remote-registry-test`)
         await containerHelpers.removeLocalImage("remote-registry-test", log, ctx)
-        await containerHelpers.removeLocalImage(
-          "europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/remote-registry-test",
-          log,
-          ctx
-        )
+        await containerHelpers.removeLocalImage(`${deploymentRegistry}/remote-registry-test`, log, ctx)
       })
 
       it("should publish the built image", async () => {
@@ -460,11 +462,10 @@ describe.skip("Kubernetes Container Build Extension", () => {
         })
 
         expect(result.detail?.message).to.eql(
-          "Published europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/remote-registry-test:" +
-            action.versionString()
+          `Published ${deploymentRegistry}/remote-registry-test:` + action.versionString()
         )
 
-        const remoteTags = await listGoogleArtifactImageTags("remote-registry-test")
+        const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/remote-registry-test`)
         expect(remoteTags).has.length(2)
         expect(remoteTags).to.have.members([action.versionString(), "_buildcache"])
       })
@@ -479,11 +480,9 @@ describe.skip("Kubernetes Container Build Extension", () => {
           tag: "foo",
         })
 
-        expect(result.detail?.message).to.eql(
-          "Published europe-west3-docker.pkg.dev/garden-ci/garden-integ-tests/remote-registry-test:foo"
-        )
+        expect(result.detail?.message).to.eql(`Published ${deploymentRegistry}/remote-registry-test:foo`)
 
-        const remoteTags = await listGoogleArtifactImageTags("remote-registry-test")
+        const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/remote-registry-test`)
         expect(remoteTags).has.length(3)
         expect(remoteTags).to.have.members(["foo", action.versionString(), "_buildcache"])
       })
@@ -501,13 +500,13 @@ describe.skip("Kubernetes Container Build Extension", () => {
         cleanup()
       }
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
     })
 
     it("should build a simple container", async () => {
       const action = await executeBuild("simple-service")
 
-      const remoteTags = await listGoogleArtifactImageTags("simple-service")
+      const remoteTags = await listGoogleArtifactImageTags(`${deploymentRegistry}/simple-service`)
       expect(remoteTags).has.length(2)
       expect(remoteTags).to.have.members([action.versionString(), "_buildcache"])
     })
@@ -523,7 +522,7 @@ describe.skip("Kubernetes Container Build Extension", () => {
 
       expect(resultReady.state).to.equal("ready")
 
-      await deleteGoogleArtifactImage("simple-service")
+      await deleteGoogleArtifactImage(`${deploymentRegistry}/simple-service`)
 
       const resultNotExists = await builder.handlers.getStatus!({
         ctx,
