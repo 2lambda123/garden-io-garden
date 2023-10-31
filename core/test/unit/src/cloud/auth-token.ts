@@ -9,15 +9,27 @@
 import { expect } from "chai"
 import { getRootLogger } from "../../../../src/logger/logger"
 import { gardenEnv } from "../../../../src/constants"
-import { CloudApi } from "../../../../src/cloud/api"
+import { CloudApi, CloudUserProfile } from "../../../../src/cloud/api"
 import { uuidv4 } from "../../../../src/util/random"
 import { randomString } from "../../../../src/util/string"
 import { GlobalConfigStore } from "../../../../src/config-store/global"
+import { makeTempDir, TempDirectory } from "../../../helpers"
 
-describe("CloudApi", () => {
+describe("AuthToken", () => {
   const log = getRootLogger().createLog()
-  const domain = "https://garden." + randomString()
-  const globalConfigStore = new GlobalConfigStore()
+  let domain: string
+  let globalConfigStore: GlobalConfigStore
+  let tmpDir: TempDirectory
+
+  beforeEach(async () => {
+    domain = "https://garden." + randomString()
+    tmpDir = await makeTempDir({ git: false })
+    globalConfigStore = new GlobalConfigStore(tmpDir.path)
+  })
+
+  afterEach(async () => {
+    await tmpDir.cleanup()
+  })
 
   describe("getAuthToken", () => {
     it("should return null when no auth token is present", async () => {
@@ -31,9 +43,49 @@ describe("CloudApi", () => {
         refreshToken: uuidv4(),
         tokenValidity: 9999,
       }
-      await CloudApi.saveAuthToken(log, globalConfigStore, testToken, domain)
+      await CloudApi.saveAuthToken({ log, globalConfigStore, tokenResponse: testToken, domain })
       const savedToken = await CloudApi.getAuthToken(log, globalConfigStore, domain)
       expect(savedToken).to.eql(testToken.token)
+    })
+
+    it("should return a user profile if stored", async () => {
+      const testToken = {
+        token: uuidv4(),
+        refreshToken: uuidv4(),
+        tokenValidity: 9999,
+      }
+      const userProfile: CloudUserProfile = {
+        userId: "some-uuid",
+        organizationName: "some-org-name",
+        domain,
+      }
+
+      await CloudApi.saveAuthToken({ log, globalConfigStore, tokenResponse: testToken, domain, userProfile })
+      const savedToken = await CloudApi.getAuthToken(log, globalConfigStore, domain)
+      expect(savedToken).to.eql(testToken.token)
+
+      const savedProfile = await CloudApi.getAuthTokenUserProfile(log, globalConfigStore, domain)
+      expect(savedProfile).to.eql(userProfile)
+    })
+
+    it("should not return a user profile when the token has expired", async () => {
+      const testToken = {
+        token: uuidv4(),
+        refreshToken: uuidv4(),
+        tokenValidity: -9999,
+      }
+      const userProfile: CloudUserProfile = {
+        userId: "some-uuid",
+        organizationName: "some-org-name",
+        domain,
+      }
+
+      await CloudApi.saveAuthToken({ log, globalConfigStore, tokenResponse: testToken, domain, userProfile })
+      const savedToken = await CloudApi.getAuthToken(log, globalConfigStore, domain)
+      expect(savedToken).to.eql(testToken.token)
+
+      const savedProfile = await CloudApi.getAuthTokenUserProfile(log, globalConfigStore, domain)
+      expect(savedProfile).to.be.undefined
     })
 
     it("should return the value of GARDEN_AUTH_TOKEN if it's present", async () => {
@@ -56,7 +108,7 @@ describe("CloudApi", () => {
         refreshToken: uuidv4(),
         tokenValidity: 9999,
       }
-      await CloudApi.saveAuthToken(log, globalConfigStore, testToken, domain)
+      await CloudApi.saveAuthToken({ log, globalConfigStore, tokenResponse: testToken, domain })
       await CloudApi.clearAuthToken(log, globalConfigStore, domain)
       const savedToken = await CloudApi.getAuthToken(log, globalConfigStore, domain)
       expect(savedToken).to.be.undefined

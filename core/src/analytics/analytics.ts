@@ -15,19 +15,21 @@ import { getPackageVersion, sleep, getDurationMsec } from "../util/util"
 import { SEGMENT_PROD_API_KEY, SEGMENT_DEV_API_KEY, gardenEnv } from "../constants"
 import { Log } from "../logger/log-entry"
 import hasha = require("hasha")
-import { Garden } from "../garden"
+import { DummyGarden, Garden } from "../garden"
 import { AnalyticsCommandResult, AnalyticsEventType } from "./analytics-types"
 import dedent from "dedent"
 import { getGitHubUrl } from "../docs/common"
 import { Profile } from "../util/profiling"
 import { ModuleConfig } from "../config/module"
-import { UserResult } from "@garden-io/platform-api-types"
 import { uuidv4 } from "../util/random"
 import { GardenError, NodeJSErrnoErrorCodes, StackTraceMetadata } from "../exceptions"
 import { ActionConfigMap } from "../actions/types"
 import { actionKinds } from "../actions/types"
 import { getResultErrorProperties } from "./helpers"
 import segmentClient = require("analytics-node")
+import { findProjectConfig } from "../config/base"
+import { ProjectConfig } from "../config/project"
+import { CloudApi, CloudUserProfile, getGardenCloudDomain } from "../cloud/api"
 
 const CI_USER = "ci-user"
 
@@ -113,7 +115,9 @@ interface PropertiesBase {
   enterpriseDomainV2?: string
   isLoggedIn: boolean
   cloudUserId?: string
+  cloudDomain?: string
   customer?: string
+  organizationName?: string
   ciName: string | null
   system: SystemInfo
   isCI: boolean
@@ -214,6 +218,7 @@ interface IdentifyEvent {
   traits: {
     userIdV2: string
     customer?: string
+    organizationName?: string
     platform: string
     platformVersion: string
     gardenVersion: string
@@ -270,13 +275,15 @@ export class AnalyticsHandler {
   private enterpriseProjectIdV2?: string
   private enterpriseDomainV2?: string
   private isLoggedIn: boolean
+  // These are set for a logged in user
   private cloudUserId?: string
-  private cloudCustomerName?: string
+  private cloudOrganizationName?: string
+  private cloudDomain?: string
   private ciName: string | null
   private systemConfig: SystemInfo
   private isCI: boolean
   private sessionId: string
-  private pendingEvents: Map<string, SegmentEvent>
+  private pendingEvents: Map<string, SegmentEvent | IdentifyEvent>
   protected garden: Garden
   private projectMetadata: ProjectMetadata
   public isEnabled: boolean
@@ -292,6 +299,9 @@ export class AnalyticsHandler {
     cloudUser,
     isEnabled,
     ciInfo,
+    projectName,
+    configuredCloudDomain,
+    configuredCloudProjectId,
   }: {
     garden: Garden
     log: Log
@@ -300,8 +310,11 @@ export class AnalyticsHandler {
     moduleConfigs: ModuleConfig[]
     actionConfigs: ActionConfigMap
     isEnabled: boolean
-    cloudUser?: UserResult
+    cloudUser?: CloudUserProfile
     ciInfo: CiInfo
+    projectName: string
+    configuredCloudDomain?: string
+    configuredCloudProjectId?: string
   }) {
     const segmentApiKey = gardenEnv.ANALYTICS_DEV ? SEGMENT_DEV_API_KEY : SEGMENT_PROD_API_KEY
 
@@ -351,10 +364,10 @@ export class AnalyticsHandler {
 
     const originName = this.garden.vcsInfo.originUrl
 
-    const projectName = this.garden.projectName
     this.projectName = AnalyticsHandler.hash(projectName)
     this.projectNameV2 = AnalyticsHandler.hashV2(projectName)
 
+    // Note, this is not the project id from the Project config, its referred to as enterpriseProjectId below
     const projectId = originName || this.projectName
     this.projectId = AnalyticsHandler.hash(projectId)
     this.projectIdV2 = AnalyticsHandler.hashV2(projectId)
@@ -362,32 +375,32 @@ export class AnalyticsHandler {
     // The enterprise project ID is the UID for this project in Garden Cloud that the user puts
     // in the project level Garden configuration. Not to be confused with the anonymized project ID we generate from
     // the project name for the purpose of analytics.
-    const enterpriseProjectId = this.garden.projectId
-    if (enterpriseProjectId) {
-      this.enterpriseProjectId = AnalyticsHandler.hash(enterpriseProjectId)
-      this.enterpriseProjectIdV2 = AnalyticsHandler.hashV2(enterpriseProjectId)
+    if (configuredCloudProjectId && configuredCloudDomain) {
+      this.enterpriseProjectId = AnalyticsHandler.hash(configuredCloudProjectId)
+      this.enterpriseProjectIdV2 = AnalyticsHandler.hashV2(configuredCloudProjectId)
+      this.enterpriseDomain = AnalyticsHandler.hash(configuredCloudDomain)
+      this.enterpriseDomainV2 = AnalyticsHandler.hashV2(configuredCloudDomain)
     }
 
-    const enterpriseDomain = this.garden.cloudDomain
-    if (enterpriseDomain) {
-      this.enterpriseDomain = AnalyticsHandler.hash(enterpriseDomain)
-      this.enterpriseDomainV2 = AnalyticsHandler.hashV2(enterpriseDomain)
-    }
-
+    // A user can be logged in to the community tier
     if (cloudUser) {
-      this.cloudUserId = AnalyticsHandler.makeCloudUserId(cloudUser)
-      this.cloudCustomerName = cloudUser.organization.name
+      this.cloudUserId = AnalyticsHandler.makeUniqueCloudUserId(cloudUser)
+      this.cloudOrganizationName = cloudUser.organizationName
+      this.cloudDomain = this.garden.cloudDomain
+      this.isLoggedIn = true
     }
 
     this.isRecurringUser = getIsRecurringUser(analyticsConfig.firstRunAt, analyticsConfig.latestRunAt)
 
     const userIdV2 = AnalyticsHandler.hashV2(anonymousUserId)
+
     this.identify({
       userId: this.cloudUserId,
       anonymousId: anonymousUserId,
       traits: {
         userIdV2,
-        customer: cloudUser?.organization.name,
+        customer: cloudUser?.organizationName,
+        organizationName: cloudUser?.organizationName,
         platform: platform(),
         platformVersion: release(),
         gardenVersion: getPackageVersion(),
@@ -445,14 +458,57 @@ export class AnalyticsHandler {
     const moduleConfigs = await garden.getRawModuleConfigs()
     const actionConfigs = await garden.getRawActionConfigs()
 
-    let cloudUser: UserResult | undefined
+    let cloudUser: CloudUserProfile | undefined
     if (garden.cloudApi) {
       try {
-        cloudUser = await garden.cloudApi?.getProfile()
+        const userProfile = await garden.cloudApi?.getProfile()
+
+        if (userProfile && userProfile.id && userProfile.organization.name) {
+          cloudUser = {
+            userId: userProfile.id,
+            organizationName: userProfile.organization.name,
+            domain: garden.cloudApi.domain,
+          }
+        }
       } catch (err) {
         log.debug(`Getting profile from API failed with error: ${err}`)
       }
     }
+
+    // best effort load the project if this is a dummy garden instance
+    let projectName = garden.projectName
+
+    let projectConfig: ProjectConfig | undefined
+
+    if (garden instanceof DummyGarden) {
+      // Not logged in and this is a dummy instance, try to best effort retrieve the config
+      projectConfig = await findProjectConfig({ log, path: garden.projectRoot })
+
+      // override the project name since it will default to no-project
+      if (projectConfig) {
+        projectName = projectConfig.name
+
+        if (!garden.cloudApi) {
+          const fallbackCloudDomain = getGardenCloudDomain(projectConfig.domain)
+
+          // fallback to the stored user profile (this is done without verifying the token and the content)
+          const userProfile = await CloudApi.getAuthTokenUserProfile(log, garden.globalConfigStore, fallbackCloudDomain)
+
+          if (userProfile) {
+            cloudUser = {
+              userId: userProfile.userId,
+              organizationName: userProfile.organizationName,
+              domain: fallbackCloudDomain,
+            }
+          }
+        }
+      }
+    } else {
+      projectConfig = garden.getProjectConfig()
+    }
+
+    const configuredCloudDomain = projectConfig?.domain
+    const configuredCloudProjectId = projectConfig?.id
 
     if (isFirstRun && !ciInfo.isCi) {
       const gitHubUrl = getGitHubUrl("docs/misc/telemetry.md")
@@ -502,6 +558,9 @@ export class AnalyticsHandler {
       isEnabled,
       ciInfo,
       anonymousUserId,
+      projectName,
+      configuredCloudDomain,
+      configuredCloudProjectId,
     })
   }
 
@@ -529,8 +588,8 @@ export class AnalyticsHandler {
     }
   }
 
-  static makeCloudUserId(cloudUser: UserResult) {
-    return `${cloudUser.organization.name}_${cloudUser.id}`
+  static makeUniqueCloudUserId(cloudUser: CloudUserProfile) {
+    return `${cloudUser.organizationName}_${cloudUser.userId}`
   }
 
   /**
@@ -547,8 +606,11 @@ export class AnalyticsHandler {
       enterpriseDomain: this.enterpriseDomain,
       enterpriseDomainV2: this.enterpriseDomainV2,
       isLoggedIn: this.isLoggedIn,
+      cloudUserId: this.cloudUserId,
+      cloudDomain: this.cloudDomain,
       ciName: this.ciName,
-      customer: this.cloudCustomerName,
+      customer: this.cloudOrganizationName,
+      organizationName: this.cloudOrganizationName,
       system: this.systemConfig,
       isCI: this.isCI,
       sessionId: this.sessionId,
@@ -607,7 +669,20 @@ export class AnalyticsHandler {
     if (!this.segment || !this.isEnabled) {
       return false
     }
-    this.segment.identify(event)
+
+    const eventUid = uuidv4()
+    this.pendingEvents.set(eventUid, event)
+    this.segment.identify(event, (err: any) => {
+      this.pendingEvents.delete(eventUid)
+
+      this.log.silly(dedent`Tracking identify event.
+          Payload:
+            ${JSON.stringify(event)}
+        `)
+      if (err && this.log) {
+        this.log.debug(`Error sending identify tracking event: ${err}`)
+      }
+    })
     return event
   }
 
@@ -774,7 +849,13 @@ export class AnalyticsHandler {
       if (this.pendingEvents.size === 0 || retry >= 3) {
         if (this.pendingEvents.size > 0) {
           const pendingEvents = Array.from(this.pendingEvents.values())
-            .map((event) => event.event)
+            .map((event: SegmentEvent | IdentifyEvent) => {
+              if ("event" in event) {
+                return event.event
+              } else {
+                return event
+              }
+            })
             .join(", ")
           this.log.debug(`Timed out while waiting for events to flush: ${pendingEvents}`)
         }

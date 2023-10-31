@@ -100,6 +100,13 @@ export interface CloudSessionResponse {
   shortId: string
 }
 
+// Internal representation of the cloud user profile
+export interface CloudUserProfile {
+  userId: string
+  organizationName: string
+  domain: string
+}
+
 export interface CloudSession extends CloudSessionResponse {
   api: CloudApi
   id: string
@@ -164,6 +171,14 @@ export interface CloudApiFactoryParams {
   cloudDomain: string
   globalConfigStore: GlobalConfigStore
   skipLogging?: boolean
+}
+
+export interface SaveAuthTokenParams {
+  log: Log
+  globalConfigStore: GlobalConfigStore
+  tokenResponse: AuthTokenResponse
+  domain: string
+  userProfile?: CloudUserProfile
 }
 
 export type CloudApiFactory = (params: CloudApiFactoryParams) => Promise<CloudApi | undefined>
@@ -253,12 +268,13 @@ export class CloudApi {
     return api
   }
 
-  static async saveAuthToken(
-    log: Log,
-    globalConfigStore: GlobalConfigStore,
-    tokenResponse: AuthTokenResponse,
-    domain: string
-  ) {
+  static async saveAuthToken({
+    log,
+    globalConfigStore,
+    tokenResponse,
+    domain,
+    userProfile = undefined,
+  }: SaveAuthTokenParams) {
     const distroName = getCloudDistributionName(domain)
 
     if (!tokenResponse.token) {
@@ -275,6 +291,8 @@ export class CloudApi {
         token: tokenResponse.token,
         refreshToken: tokenResponse.refreshToken,
         validity: add(new Date(), { seconds: validityMs / 1000 }),
+        userId: userProfile?.userId,
+        organizationName: userProfile?.organizationName,
       })
       log.debug("Saved client auth token to config store")
     } catch (error) {
@@ -325,6 +343,31 @@ export class CloudApi {
       return tokenFromEnv
     }
     return (await CloudApi.getStoredAuthToken(log, globalConfigStore, domain))?.token
+  }
+
+  /**
+   * Retrieve a user and user organization based on the values stored in the auth token.
+   */
+  static async getAuthTokenUserProfile(
+    log: Log,
+    globalConfigStore: GlobalConfigStore,
+    domain: string
+  ): Promise<CloudUserProfile | undefined> {
+    const authToken = await CloudApi.getStoredAuthToken(log, globalConfigStore, domain)
+
+    if (!authToken) {
+      return undefined
+    }
+
+    if (authToken.validity < new Date()) {
+      return undefined
+    }
+
+    if (!authToken.userId || !authToken.organizationName) {
+      return undefined
+    }
+
+    return { userId: authToken.userId, organizationName: authToken.organizationName, domain }
   }
 
   /**
@@ -461,7 +504,21 @@ export class CloudApi {
         refreshToken: rt.value || "",
         tokenValidity: res.data.jwtValidity,
       }
-      await CloudApi.saveAuthToken(this.log, this.globalConfigStore, tokenObj, this.domain)
+      let userProfile: CloudUserProfile | undefined
+      if (token.userId && token.organizationName) {
+        userProfile = {
+          userId: token.userId,
+          organizationName: token.organizationName,
+          domain: this.domain,
+        }
+      }
+      await CloudApi.saveAuthToken({
+        log: this.log,
+        globalConfigStore: this.globalConfigStore,
+        tokenResponse: tokenObj,
+        domain: this.domain,
+        userProfile,
+      })
     } catch (err) {
       if (!(err instanceof GotHttpError)) {
         throw err
