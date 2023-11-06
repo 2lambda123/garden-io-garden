@@ -55,7 +55,7 @@ import { GitHandler } from "./vcs/git"
 import { BuildStaging } from "./build-staging/build-staging"
 import { ConfigGraph, ResolvedConfigGraph } from "./graph/config-graph"
 import { getRootLogger } from "./logger/logger"
-import { GardenPluginSpec } from "./plugin/plugin"
+import type { GardenPluginSpec } from "./plugin/plugin"
 import {
   loadConfigResources,
   findProjectConfig,
@@ -120,7 +120,7 @@ import {
 import { WorkflowConfig, WorkflowConfigMap, resolveWorkflowConfig, isWorkflowConfig } from "./config/workflow"
 import { PluginTool, PluginTools } from "./util/ext-tools"
 import { ConfigTemplateResource, resolveConfigTemplate, ConfigTemplateConfig } from "./config/config-template"
-import { TemplatedModuleConfig } from "./plugins/templated"
+import type { TemplatedModuleConfig } from "./plugins/templated"
 import { BuildStagingRsync } from "./build-staging/rsync"
 import {
   DefaultEnvironmentContext,
@@ -146,15 +146,15 @@ import {
 import { actionIsDisabled, actionReferenceToString, isActionConfig } from "./actions/base"
 import { GraphSolver, SolveOpts, SolveParams, SolveResult } from "./graph/solver"
 import { actionConfigsToGraph, actionFromConfig, executeAction, resolveAction, resolveActions } from "./graph/actions"
-import { ActionTypeDefinition } from "./plugin/action-types"
+import type { ActionTypeDefinition } from "./plugin/action-types"
 import type { Task } from "./tasks/base"
-import { GraphResultFromTask, GraphResults } from "./graph/results"
+import type { GraphResultFromTask, GraphResults } from "./graph/results"
 import { uuidv4 } from "./util/random"
 import { convertTemplatedModuleToRender, RenderTemplateConfig, renderConfigTemplate } from "./config/render-template"
 import { MonitorManager } from "./monitors/manager"
 import { AnalyticsHandler } from "./analytics/analytics"
 import { getGardenInstanceKey } from "./server/helpers"
-import { SuggestedCommand } from "./commands/base"
+import type { SuggestedCommand } from "./plugin/handlers/Provider/suggestCommands"
 import { OtelTraced } from "./util/open-telemetry/decorators"
 import { wrapActiveSpan } from "./util/open-telemetry/spans"
 import { GitRepoHandler } from "./vcs/git-repo"
@@ -703,7 +703,7 @@ export class Garden {
 
     this.log.silly(`Resolving provider ${name}`)
 
-    const providers = await this.resolveProviders(log, false, [name])
+    const providers = await this.resolveProviders(log, { names: [name] })
     const provider = providers[name]
 
     if (!provider) {
@@ -719,10 +719,20 @@ export class Garden {
     return provider
   }
 
+  /**
+   * Resolve all or specified providers. If noInit=true is set, the environment status is not resolved
+   * and `prepareEnvironment` is not called.
+   */
   @OtelTraced({
     name: "resolveProviders",
   })
-  async resolveProviders(log: Log, forceInit = false, names?: string[]): Promise<ProviderMap> {
+  async resolveProviders(
+    log: Log,
+    opts: { forceInit?: boolean; names?: string[]; noInit?: boolean } = {}
+  ): Promise<ProviderMap> {
+    const { forceInit = false, noInit = false } = opts
+    let names = opts.names
+
     // TODO: split this out of the Garden class
     let providers: Provider[] = []
 
@@ -736,16 +746,25 @@ export class Garden {
       throwOnMissingSecretKeys(rawConfigs, this.secrets, "Provider", log)
 
       // As an optimization, we return immediately if all requested providers are already resolved
-      const alreadyResolvedProviders = names.map((name) => this.resolvedProviders[name]).filter(Boolean)
+      const alreadyResolvedProviders = names
+        .map((name) => this.resolvedProviders[name])
+        .filter((p) => {
+          if (!p) {
+            return false
+          }
+          // If noInit=false and status is missing, we need to resolve the provider fully
+          if (!noInit && !p.status) {
+            return false
+          }
+          return true
+        })
       if (alreadyResolvedProviders.length === names.length) {
         providers = cloneDeep(alreadyResolvedProviders)
         return
       }
 
-      log.silly(`Resolving providers`)
-
       const providerLog = log.createLog({ name: "providers", showDuration: true })
-      providerLog.info("Getting status...")
+      providerLog.info(opts.names ? `Resolving providers ${naturalList(names)}...` : "Resolving all providers...")
 
       const plugins = keyBy(await this.getAllPlugins(), "name")
 
@@ -797,6 +816,7 @@ export class Garden {
           force: false,
           forceRefresh: this.forceRefresh,
           forceInit,
+          noInit,
           allPlugins: Object.values(plugins),
         })
       })
@@ -824,7 +844,7 @@ export class Garden {
 
       providers = providerResults.map((result) => result!.result)
 
-      const gotCachedResult = !!providers.find((p) => p.status.cached)
+      const gotCachedResult = !!providers.find((p) => p.status?.cached)
 
       await Promise.all(
         providers.flatMap((provider) =>
@@ -897,7 +917,7 @@ export class Garden {
    */
   async getEnvironmentStatus(log: Log) {
     const providers = await this.resolveProviders(log)
-    return mapValues(providers, (p) => p.status)
+    return mapValues(providers, (p) => p.status!)
   }
 
   @pMemoizeDecorator()
@@ -961,13 +981,13 @@ export class Garden {
     name: "getConfigGraph",
   })
   async getConfigGraph({ log, graphResults, emit, actionModes = {} }: GetConfigGraphParams): Promise<ConfigGraph> {
+    const graphLog = log.createLog({ name: "graph", showDuration: true }).info(`Resolving actions and modules...`)
+
     // TODO: split this out of the Garden class
     await this.scanAndAddConfigs()
 
     const resolvedProviders = await this.resolveProviders(log)
     const rawModuleConfigs = await this.getRawModuleConfigs()
-
-    const graphLog = log.createLog({ name: "graph", showDuration: true }).info(`Resolving actions and modules...`)
 
     // Resolve the project module configs
     const resolver = new ModuleResolver({
@@ -1079,35 +1099,34 @@ export class Garden {
       let updated = false
 
       // Resolve actions from augmentGraph specs and add to the list
-      await Promise.all(
-        (addActions || []).map(async (config) => {
-          // There is no actual config file for plugin modules (which the prepare function assumes)
-          delete config.internal?.configFilePath
+      // Note: Looping sequentially here to allow actions to depend on one another in the addActions list.
+      for (const config of addActions || []) {
+        // There is no actual config file for plugin modules (which the prepare function assumes)
+        delete config.internal?.configFilePath
 
-          if (!config.internal.basePath) {
-            config.internal.basePath = this.projectRoot
-          }
+        if (!config.internal.basePath) {
+          config.internal.basePath = this.projectRoot
+        }
 
-          const key = actionReferenceToString(config)
+        const key = actionReferenceToString(config)
 
-          const action = await actionFromConfig({
-            garden: this,
-            graph,
-            config,
-            router,
-            log: graphLog,
-            configsByKey: actionConfigs,
-            mode: actionModes[key] || "default",
-            linkedSources,
-            scanRoot: config.internal.basePath,
-          })
-
-          graph.addAction(action)
-          actionConfigs[key] = config
-
-          updated = true
+        const action = await actionFromConfig({
+          garden: this,
+          graph,
+          config,
+          router,
+          log: graphLog,
+          configsByKey: actionConfigs,
+          mode: actionModes[key] || "default",
+          linkedSources,
+          scanRoot: config.internal.basePath,
         })
-      )
+
+        graph.addAction(action)
+        actionConfigs[key] = config
+
+        updated = true
+      }
 
       for (const dependency of addDependencies || []) {
         for (const key of ["by", "on"]) {
@@ -1156,7 +1175,12 @@ export class Garden {
 
   async getResolvedConfigGraph(params: GetConfigGraphParams): Promise<ResolvedConfigGraph> {
     const graph = await this.getConfigGraph(params)
-    const resolved = await this.resolveActions({ graph, actions: graph.getActions(), log: params.log })
+    const actions = graph.getActions()
+    const resolved = await this.resolveActions({
+      graph,
+      actions: actions.filter((a) => !a.isDisabled()),
+      log: params.log,
+    })
     return new ResolvedConfigGraph({
       actions: Object.values(resolved),
       moduleGraph: graph.moduleGraph,
@@ -1418,10 +1442,15 @@ export class Garden {
     const existing = this.actionConfigs[config.kind][config.name]
 
     if (existing) {
-      if (actionIsDisabled(config, this.environmentName)) {
+      const disabled = actionIsDisabled(config, this.environmentName)
+      const existingDisabled = actionIsDisabled(existing, this.environmentName)
+
+      if (disabled) {
         this.log.silly(`Skipping action ${key} because it is disabled and another action with the same key exists`)
         return
-      } else if (!actionIsDisabled(existing, this.environmentName)) {
+      } else if (existingDisabled) {
+        this.log.silly(`Overriding disabled action ${key} because another enabled action with the same key exists`)
+      } else if (!existingDisabled) {
         const paths = [
           existing.internal.configFilePath || existing.internal.basePath,
           config.internal.configFilePath || config.internal.basePath,
@@ -1607,6 +1636,7 @@ export class Garden {
     resolveWorkflows?: boolean
   }): Promise<ConfigDump> {
     let providers: ConfigDump["providers"] = []
+    let suggestedCommands: SuggestedCommand[] = []
     let moduleConfigs: ModuleConfig[]
     let workflowConfigs: WorkflowConfig[]
     let actionConfigs: ActionConfigMap = {
@@ -1617,9 +1647,10 @@ export class Garden {
     }
 
     await this.scanAndAddConfigs()
-
     if (resolveProviders) {
-      providers = Object.values(await this.resolveProviders(log))
+      const resolvedProviders = Object.values(await this.resolveProviders(log))
+      suggestedCommands = await this.getSuggestedCommands(log, resolvedProviders)
+      providers = resolvedProviders
     } else {
       providers = this.getRawProviderConfigs()
     }
@@ -1637,12 +1668,15 @@ export class Garden {
         modules.map((m) => m._config),
         "name"
       )
+    } else {
+      moduleConfigs = await this.getRawModuleConfigs()
+      actionConfigs = this.actionConfigs
+    }
+
+    if (resolveWorkflows) {
       workflowConfigs = (await this.getRawWorkflowConfigs()).map((config) => resolveWorkflowConfig(this, config))
     } else {
-      providers = this.getRawProviderConfigs()
-      moduleConfigs = await this.getRawModuleConfigs()
       workflowConfigs = await this.getRawWorkflowConfigs()
-      actionConfigs = this.actionConfigs
     }
 
     const allEnvironmentNames = this.projectConfig.environments.map((c) => c.name)
@@ -1661,11 +1695,11 @@ export class Garden {
       projectId: this.projectId,
       domain: this.cloudDomain,
       sources: this.projectSources,
-      suggestedCommands: await this.getSuggestedCommands(),
+      suggestedCommands,
     }
   }
 
-  public async getSuggestedCommands(): Promise<SuggestedCommand[]> {
+  public async getSuggestedCommands(log: Log, providers: Provider[]): Promise<SuggestedCommand[]> {
     const suggestions: SuggestedCommand[] = [
       {
         name: "deploy",
@@ -1674,7 +1708,15 @@ export class Garden {
       },
     ]
 
-    // TODO: call plugin handlers to get plugin-specific suggestions
+    // Call plugin handlers to get plugin-specific suggestions
+    const router = await this.getActionRouter()
+
+    await Promise.all(
+      providers.map(async (provider) => {
+        const { commands } = await router.provider.suggestCommands({ log, provider })
+        suggestions.push(...commands.map((c) => ({ ...c, source: c.source || provider.name })))
+      })
+    )
 
     return suggestions
   }
