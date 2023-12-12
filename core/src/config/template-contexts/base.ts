@@ -8,23 +8,27 @@
 
 import type Joi from "@hapi/joi"
 import { isString } from "lodash-es"
-import { ConfigurationError } from "../../exceptions.js"
-import {
-  resolveTemplateString,
-  TemplateStringMissingKeyException,
-  TemplateStringPassthroughException,
-} from "../../template-string/template-string.js"
+import { ConfigurationError, NotFoundError } from "../../exceptions.js"
+import { resolveTemplateString } from "../../template-string/template-string.js"
 import type { CustomObjectSchema } from "../common.js"
 import { isPrimitive, joi, joiIdentifier } from "../common.js"
 import { KeyedSet } from "../../util/keyed-set.js"
 import { naturalList } from "../../util/string.js"
 import { styles } from "../../logger/styles.js"
+import type { TemplateValue } from "../../template-string/inputs.js"
+import { TemplateLeaf, isTemplateLeafValue, isTemplateLeaf } from "../../template-string/inputs.js"
+import type { CollectionOrValue } from "../../util/objects.js"
+import { deepMap } from "../../util/objects.js"
+import { LazyValue } from "../../template-string/lazy.js"
 
 export type ContextKeySegment = string | number
 export type ContextKey = ContextKeySegment[]
 
+export type ObjectPath = (string | number)[]
+
 export interface ContextResolveOpts {
   // Allow templates to be partially resolved (used to defer runtime template resolution, for example)
+  // TODO: rename to optional
   allowPartial?: boolean
   // a list of previously resolved paths, used to detect circular references
   stack?: string[]
@@ -41,7 +45,10 @@ export interface ContextResolveParams {
 export interface ContextResolveOutput {
   message?: string
   partial?: boolean
-  resolved: any
+  result: CollectionOrValue<TemplateValue>
+  cached: boolean
+  // for input tracking
+  // ResolvedResult: ResolvedResult
 }
 
 export function schema(joiSchema: Joi.Schema) {
@@ -56,9 +63,10 @@ export interface ConfigContextType {
 }
 
 // Note: we're using classes here to be able to use decorators to describe each context node and key
+// TODO-steffen&thor: Make all instance variables of all config context classes read-only.
 export abstract class ConfigContext {
   private readonly _rootContext: ConfigContext
-  private readonly _resolvedValues: { [path: string]: any }
+  private readonly _resolvedValues: { [path: string]: CollectionOrValue<TemplateValue> }
 
   // This is used for special-casing e.g. runtime.* resolution
   protected _alwaysAllowPartial: boolean
@@ -87,10 +95,10 @@ export abstract class ConfigContext {
     const fullPath = renderKeyPath(nodePath.concat(key))
 
     // if the key has previously been resolved, return it directly
-    const resolved = this._resolvedValues[path]
+    const cachedResult = this._resolvedValues[path]
 
-    if (resolved) {
-      return { resolved }
+    if (cachedResult) {
+      return { cached: true, result: cachedResult }
     }
 
     opts.stack = [...(opts.stack || [])]
@@ -150,9 +158,14 @@ export abstract class ConfigContext {
         if (remainder.length > 0) {
           opts.stack.push(stackEntry)
           const res = value.resolve({ key: remainder, nodePath: nestedNodePath, opts })
-          value = res.resolved
+          value = res.result
           message = res.message
           partial = !!res.partial
+        } else {
+          // TODO: improve error message
+          throw new ConfigurationError({
+            message: `Resolving to a context is not allowed.`,
+          })
         }
         break
       }
@@ -161,6 +174,10 @@ export abstract class ConfigContext {
       if (isString(value)) {
         opts.stack.push(stackEntry)
         value = resolveTemplateString({ string: value, context: this._rootContext, contextOpts: opts })
+      }
+
+      if (isTemplateLeaf(value) || value instanceof LazyValue) {
+        break
       }
 
       if (value === undefined) {
@@ -188,31 +205,55 @@ export abstract class ConfigContext {
         }
       }
 
-      // If we're allowing partial strings, we throw the error immediately to end the resolution flow. The error
-      // is caught in the surrounding template resolution code.
-      if (this._alwaysAllowPartial) {
-        // We use a separate exception type when contexts are specifically indicating that unresolvable keys should
-        // be passed through. This is caught in the template parser code.
-        throw new TemplateStringPassthroughException({
-          message,
-        })
-      } else if (opts.allowPartial) {
-        throw new TemplateStringMissingKeyException({
-          message,
-        })
+      if (!opts.allowPartial && !this._alwaysAllowPartial) {
+        throw new NotFoundError({ message })
       } else {
-        // Otherwise we return the undefined value, so that any logical expressions can be evaluated appropriately.
-        // The template resolver will throw the error later if appropriate.
-        return { resolved: undefined, message }
+        return {
+          message,
+          cached: false,
+          result: new TemplateLeaf({
+            expr: undefined,
+            value: undefined,
+            inputs: {},
+          }),
+        }
       }
+    }
+
+    let result: CollectionOrValue<TemplateValue>
+
+    if (value instanceof LazyValue) {
+      result = value
+    } else if (isTemplateLeaf(value)) {
+      result = value
+    }
+    // Wrap normal data using deepMap
+    else if (isTemplateLeafValue(value)) {
+      result = new TemplateLeaf({
+        expr: undefined,
+        value,
+        inputs: {},
+      })
+    } else {
+      // value is a collection
+      result = deepMap(value, (v) => {
+        if (isTemplateLeaf(v) || v instanceof LazyValue) {
+          return v
+        }
+        return new TemplateLeaf({
+          expr: undefined,
+          value: v,
+          inputs: {},
+        })
+      })
     }
 
     // Cache result, unless it is a partial resolution
     if (!partial) {
-      this._resolvedValues[path] = value
+      this._resolvedValues[path] = result
     }
 
-    return { resolved: value }
+    return { cached: false, result }
   }
 }
 
@@ -244,7 +285,11 @@ export class ScanContext extends ConfigContext {
   override resolve({ key, nodePath }: ContextResolveParams) {
     const fullKey = nodePath.concat(key)
     this.foundKeys.add(fullKey)
-    return { resolved: renderTemplateString(fullKey), partial: true }
+    return {
+      partial: true,
+      cached: false,
+      result: new TemplateLeaf({ value: renderTemplateString(fullKey), expr: undefined, inputs: {} }),
+    }
   }
 }
 
@@ -321,7 +366,7 @@ function renderTemplateString(key: ContextKeySegment[]) {
 /**
  * Given all the segments of a template string, return a string path for the key.
  */
-function renderKeyPath(key: ContextKeySegment[]): string {
+export function renderKeyPath(key: ContextKeySegment[]): string {
   // Note: We don't support bracket notation for the first part in a template string
   if (key.length === 0) {
     return ""

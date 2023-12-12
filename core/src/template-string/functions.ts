@@ -8,16 +8,16 @@
 
 import { v4 as uuidv4 } from "uuid"
 import { createHash } from "node:crypto"
-import { TemplateStringError } from "../exceptions.js"
-import { camelCase, escapeRegExp, isArrayLike, isEmpty, isString, kebabCase, keyBy, mapValues, trim } from "lodash-es"
+import { camelCase, isArrayLike, isEmpty, isString, kebabCase, keyBy, mapValues, trim } from "lodash-es"
 import type { JoiDescription, Primitive } from "../config/common.js"
 import { joi, joiPrimitive } from "../config/common.js"
 import type Joi from "@hapi/joi"
-import { validateSchema } from "../config/validation.js"
 import { load, loadAll } from "js-yaml"
 import { safeDumpYaml } from "../util/serialization.js"
 import indentString from "indent-string"
-import { maybeTemplateString } from "./template-string.js"
+import type { TemplateValue } from "./inputs.js"
+import type { CollectionOrValue } from "../util/objects.js"
+import { TemplateFunctionCallError } from "../exceptions.js"
 
 interface ExampleArgument {
   input: any[]
@@ -32,6 +32,15 @@ interface TemplateHelperFunction {
   outputSchema: Joi.Schema
   exampleArguments: ExampleArgument[]
   fn: Function
+
+  /**
+   * If the function does input tracking on its own for collection arguments, it can set this to true to avoid the default input tracking.
+   *
+   * This is useful in case the function concatenates arrays or objects, or filters arrays or objects.
+   *
+   * @default false
+   */
+  skipInputTrackingForCollectionValues?: boolean
 }
 
 const helperFunctionSpecs: TemplateHelperFunction[] = [
@@ -85,7 +94,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
         .required()
         .description("The array or string to append."),
     },
-    outputSchema: joi.string(),
+    outputSchema: joi.alternatives(joi.string(), joi.array()),
     exampleArguments: [
       {
         input: [
@@ -103,13 +112,16 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       },
       { input: ["string1", "string2"], output: "string1string2" },
     ],
-    fn: (arg1: any, arg2: any) => {
+
+    // If we receive an array, it will be raw collection values for correct input tracking when merely concatenating arrays.
+    skipInputTrackingForCollectionValues: true,
+    fn: (arg1: string | CollectionOrValue<TemplateValue>[], arg2: string | CollectionOrValue<TemplateValue>[]) => {
       if (isString(arg1) && isString(arg2)) {
         return arg1 + arg2
       } else if (Array.isArray(arg1) && Array.isArray(arg2)) {
         return [...arg1, ...arg2]
       } else {
-        throw new TemplateStringError({
+        throw new TemplateFunctionCallError({
           message: `Both terms need to be either arrays or strings (got ${typeof arg1} and ${typeof arg2}).`,
         })
       }
@@ -148,7 +160,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       { input: ["not empty"], output: false },
       { input: [null], output: true },
     ],
-    fn: (value: any) => value === undefined || isEmpty(value),
+    fn: (value: unknown) => value === undefined || isEmpty(value),
   },
   {
     name: "join",
@@ -190,7 +202,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       { input: [["some", "array"]], output: '["some","array"]' },
       { input: [{ some: "object" }], output: '{"some":"object"}' },
     ],
-    fn: (value: any) => JSON.stringify(value),
+    fn: (value: unknown) => JSON.stringify(value),
   },
   {
     name: "kebabCase",
@@ -234,8 +246,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       { input: ["string_with_underscores", "_", "-"], output: "string-with-underscores" },
       { input: ["remove.these.dots", ".", ""], output: "removethesedots" },
     ],
-    fn: (str: string, substring: string, replacement: string) =>
-      str.replace(new RegExp(escapeRegExp(substring), "g"), replacement),
+    fn: (str: string, substring: string, replacement: string) => str.replaceAll(substring, replacement),
   },
   {
     name: "sha256",
@@ -270,7 +281,9 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       { input: ["ThisIsALongStringThatINeedAPartOf", 11, -7], output: "StringThatINeed" },
       { input: [".foo", 1], output: "foo" },
     ],
-    fn: (stringOrArray: string | any[], start: number | string, end?: number | string) => {
+    // If we receive an array, it will be raw template values for correct input tracking when merely slicing arrays.
+    skipInputTrackingForCollectionValues: true,
+    fn: (stringOrArray: string | CollectionOrValue<TemplateValue>[], start: number | string, end?: number | string) => {
       const parseInt = (value: number | string, name: string): number => {
         if (typeof value === "number") {
           return value
@@ -278,7 +291,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
 
         const result = Number.parseInt(value, 10)
         if (Number.isNaN(result)) {
-          throw new TemplateStringError({
+          throw new TemplateFunctionCallError({
             message: `${name} index must be a number or a numeric string (got "${value}")`,
           })
         }
@@ -340,10 +353,11 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
       { input: [1], output: "1" },
       { input: [true], output: "true" },
     ],
-    fn: (val: any) => {
+    fn: (val: unknown) => {
       return String(val)
     },
   },
+  // TODO: What are the implications of `uuidv4` on input tracking?
   {
     name: "uuidv4",
     description: "Generates a random v4 UUID.",
@@ -397,7 +411,7 @@ const helperFunctionSpecs: TemplateHelperFunction[] = [
     fn: (value: any, multiDocument?: boolean) => {
       if (multiDocument) {
         if (!isArrayLike(value)) {
-          throw new TemplateStringError({
+          throw new TemplateFunctionCallError({
             message: `yamlEncode: Set multiDocument=true but value is not an array (got ${typeof value})`,
           })
         }
@@ -448,96 +462,4 @@ export function getHelperFunctions(): HelperFunctions {
   )
 
   return _helperFunctions
-}
-
-export function callHelperFunction({
-  functionName,
-  args,
-  text,
-  allowPartial,
-}: {
-  functionName: string
-  args: any[]
-  text: string
-  allowPartial: boolean
-}) {
-  const helperFunctions = getHelperFunctions()
-  const spec = helperFunctions[functionName]
-
-  if (!spec) {
-    const availableFns = Object.keys(helperFunctions).join(", ")
-    const _error = new TemplateStringError({
-      message: `Could not find helper function '${functionName}'. Available helper functions: ${availableFns}`,
-    })
-    return { _error }
-  }
-
-  const resolvedArgs: any[] = []
-
-  for (const arg of args) {
-    // arg can be null here because some helpers allow nulls as valid args
-    if (arg && arg._error) {
-      return arg
-    }
-
-    // allow nulls as valid arg values
-    if (arg && arg.resolved !== undefined) {
-      resolvedArgs.push(arg.resolved)
-    } else {
-      resolvedArgs.push(arg)
-    }
-  }
-
-  // Validate args
-  let i = 0
-
-  for (const [argName, schema] of Object.entries(spec.arguments)) {
-    const value = resolvedArgs[i]
-    const schemaDescription = spec.argumentDescriptions[argName]
-
-    if (value === undefined && schemaDescription.flags?.presence === "required") {
-      return {
-        _error: new TemplateStringError({
-          message: `Missing argument '${argName}' (at index ${i}) for ${functionName} helper function.`,
-        }),
-      }
-    }
-
-    try {
-      resolvedArgs[i] = validateSchema(value, schema, {
-        context: `argument '${argName}' for ${functionName} helper function`,
-        ErrorClass: TemplateStringError,
-      })
-
-      // do not apply helper function for an unresolved template string
-      if (maybeTemplateString(value)) {
-        if (allowPartial) {
-          return { resolved: "${" + text + "}" }
-        } else {
-          const _error = new TemplateStringError({
-            message: `Function '${functionName}' cannot be applied on unresolved string`,
-          })
-          return { _error }
-        }
-      }
-    } catch (_error) {
-      if (allowPartial) {
-        return { resolved: text }
-      } else {
-        return { _error }
-      }
-    }
-
-    i++
-  }
-
-  try {
-    const resolved = spec.fn(...resolvedArgs)
-    return { resolved }
-  } catch (error) {
-    const _error = new TemplateStringError({
-      message: `Error from helper function ${functionName}: ${error}`,
-    })
-    return { _error }
-  }
 }

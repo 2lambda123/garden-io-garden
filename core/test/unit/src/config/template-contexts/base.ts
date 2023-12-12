@@ -8,7 +8,11 @@
 
 import { expect } from "chai"
 import stripAnsi from "strip-ansi"
-import type { ContextKey, ContextResolveParams } from "../../../../../src/config/template-contexts/base.js"
+import type {
+  ContextKey,
+  ContextResolveOpts,
+  ContextResolveParams,
+} from "../../../../../src/config/template-contexts/base.js"
 import { ConfigContext, schema, ScanContext } from "../../../../../src/config/template-contexts/base.js"
 import { expectError } from "../../../../helpers.js"
 import { joi } from "../../../../../src/config/common.js"
@@ -35,7 +39,7 @@ describe("ConfigContext", () => {
 
   describe("resolve", () => {
     // just a shorthand to aid in testing
-    function resolveKey(c: ConfigContext, key: ContextKey, opts = {}) {
+    function resolveKey(c: ConfigContext, key: ContextKey, opts: ContextResolveOpts = {}) {
       return c.resolve({ key, nodePath: [], opts })
     }
 
@@ -46,7 +50,7 @@ describe("ConfigContext", () => {
 
     it("should return undefined for missing key", async () => {
       const c = new TestContext({})
-      const { resolved, message } = resolveKey(c, ["basic"])
+      const { result: resolved, message } = resolveKey(c, ["basic"])
       expect(resolved).to.be.undefined
       expect(stripAnsi(message!)).to.include("Could not find key basic.")
     })
@@ -90,7 +94,7 @@ describe("ConfigContext", () => {
       const c = new TestContext({
         nested: new TestContext({ key: "value" }),
       })
-      const { resolved, message } = resolveKey(c, ["basic", "bla"])
+      const { result: resolved, message } = resolveKey(c, ["basic", "bla"])
       expect(resolved).to.be.undefined
       expect(stripAnsi(message!)).to.equal("Could not find key basic. Available keys: nested.")
     })
