@@ -280,7 +280,12 @@ export class Garden {
     this.cache = params.cache
 
     this.asyncLock = new AsyncLock()
-    this.vcs = new GitHandler(params.projectRoot, params.gardenDirPath, params.dotIgnoreFiles, params.cache)
+    this.vcs = new GitHandler({
+      projectRoot: params.projectRoot,
+      gardenDirPath: params.gardenDirPath,
+      ignoreFiles: params.dotIgnoreFiles,
+      cache: params.cache,
+    })
 
     // Use the legacy build sync mode if
     // A) GARDEN_LEGACY_BUILD_STAGE=true is set or
@@ -1222,7 +1227,7 @@ export const resolveGardenParams = profileAsync(async function _resolveGardenPar
   const treeCache = new TreeCache()
 
   // Note: another VcsHandler is created later, this one is temporary
-  const gitHandler = new GitHandler(projectRoot, gardenDirPath, [], treeCache)
+  const gitHandler = new GitHandler({ projectRoot, gardenDirPath, ignoreFiles: [], cache: treeCache })
   const vcsInfo = await gitHandler.getPathInfo(log, projectRoot)
 
   // Since we iterate/traverse them before fully validating them (which we do after resolving template strings), we

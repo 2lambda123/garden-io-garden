@@ -525,7 +525,8 @@ export class ModuleResolver {
 
       try {
         await mkdirp(targetDir)
-        await writeFile(targetPath, resolvedContents)
+        // Use VcsHandler.writeFile() to make sure version is re-computed after writing new/updated files
+        await this.garden.vcs.writeFile(this.log, targetPath, resolvedContents)
       } catch (error) {
         throw new FilesystemError(
           `Unable to write templated file ${fileSpec.targetPath} from ${resolvedConfig.name}: ${error.message}`,

@@ -21,14 +21,14 @@ import { LogEntry } from "../logger/log-entry"
 import { treeVersionSchema, moduleVersionSchema } from "../config/common"
 import { dedent } from "../util/string"
 import { fixedProjectExcludes } from "../util/fs"
-import { TreeCache } from "../cache"
-import { getModuleCacheContext } from "../types/module"
+import { pathToCacheContext, TreeCache } from "../cache"
 import { ServiceConfig } from "../config/service"
 import { TaskConfig } from "../config/task"
 import { TestConfig } from "../config/test"
 import { GardenModule } from "../types/module"
 import { emitWarning } from "../warnings"
 import { validateInstall } from "../util/validateInstall"
+import { Garden } from "../garden"
 
 const AsyncLock = require("async-lock")
 const scanLock = new AsyncLock()
@@ -54,6 +54,12 @@ export async function validateGitInstall() {
 
 export interface TreeVersion {
   contentHash: string
+  /**
+   * Important! Do not use the files to determine if a file will exist when performing an action.
+   * Other mechanisms, e.g. the build command itself and `copyFrom` might affect available files at runtime.
+   *
+   * See also https://github.com/garden-io/garden/issues/5201
+   */
   files: string[]
 }
 
@@ -85,14 +91,34 @@ export interface VcsInfo {
   originUrl: string
 }
 
+export type ModuleDescription = `module ${string}`
+export type ModuleRoot = `${ModuleDescription} root`
+
+export type RepoPathDescription = "directory" | "repository" | "submodule" | "project root" | ModuleRoot
+
 export interface GetFilesParams {
   log: LogEntry
   path: string
-  pathDescription?: string
+  pathDescription?: RepoPathDescription
   include?: string[]
   exclude?: string[]
   filter?: (path: string) => boolean
   failOnPrompt?: boolean
+}
+
+export interface BaseIncludeExcludeFiles {
+  include?: string[]
+  exclude: string[]
+}
+
+export type IncludeExcludeFilesHandler<T extends GetFilesParams, R extends BaseIncludeExcludeFiles> = (
+  params: T
+) => Promise<R>
+
+export interface GetTreeVersionParams {
+  log: LogEntry
+  projectName: string
+  config: ModuleConfig
 }
 
 export interface RemoteSourceParams {
@@ -108,18 +134,36 @@ export interface VcsFile {
   hash: string
 }
 
+export interface VcsHandlerParams {
+  projectRoot: string
+  gardenDirPath: string
+  ignoreFiles: string[]
+  cache: TreeCache
+}
+
 export abstract class VcsHandler {
-  constructor(
-    protected projectRoot: string,
-    protected gardenDirPath: string,
-    protected ignoreFiles: string[],
-    private cache: TreeCache
-  ) {}
+  protected projectRoot: string
+  protected gardenDirPath: string
+  protected ignoreFiles: string[]
+  private cache: TreeCache
+
+  constructor(params: VcsHandlerParams) {
+    this.projectRoot = params.projectRoot
+    this.gardenDirPath = params.gardenDirPath
+    this.ignoreFiles = params.ignoreFiles
+    this.cache = params.cache
+  }
 
   abstract name: string
 
   abstract getRepoRoot(log: LogEntry, path: string): Promise<string>
 
+  /**
+   * Scans the repository returns the list of the tracked files.
+   * Applies Garden's exclude/include filters and .dotignore files.
+   *
+   * Does NOT sort the results by paths and filenames.
+   */
   abstract getFiles(params: GetFilesParams): Promise<VcsFile[]>
 
   abstract ensureRemoteSource(params: RemoteSourceParams): Promise<string>
@@ -134,35 +178,46 @@ export abstract class VcsHandler {
     moduleConfig: ModuleConfig,
     force = false
   ): Promise<TreeVersion> {
-    const configPath = moduleConfig.configPath
+    const cacheKey = getModuleTreeCacheKey(moduleConfig)
+    const description = describeConfig(moduleConfig)
 
-    // Apply project root excludes if the module config is in the project root and `include` isn't set
-    const exclude =
-      moduleConfig.path === this.projectRoot && !moduleConfig.include
-        ? [...(moduleConfig.exclude || []), ...fixedProjectExcludes]
-        : moduleConfig.exclude
+    // Note: duplicating this as an optimization (avoid the async lock)
+    if (!force) {
+      const cached = this.cache.get(log, cacheKey)
+      if (cached) {
+        log.silly(`Got cached tree version for ${description} (key ${cacheKey})`)
+        return cached
+      }
+    }
+
+    const configPath = getConfigFilePath(moduleConfig)
+    const path = getSourcePath(moduleConfig)
 
     let result: TreeVersion = { contentHash: NEW_MODULE_VERSION, files: [] }
-
-    const cacheKey = getModuleTreeCacheKey(moduleConfig)
 
     // Make sure we don't concurrently scan the exact same context
     await scanLock.acquire(cacheKey.join(":"), async () => {
       if (!force) {
         const cached = this.cache.get(log, cacheKey)
         if (cached) {
-          log.silly(`Got cached tree version for module ${moduleConfig.name} (key ${cacheKey})`)
+          log.silly(`Got cached tree version for ${description} (key ${cacheKey})`)
           result = cached
           return
         }
       }
 
+      // Apply project root excludes if the module config is in the project root and `include` isn't set
+      const exclude =
+        path === this.projectRoot && !moduleConfig.include
+          ? [...(moduleConfig.exclude || []), ...fixedProjectExcludes]
+          : moduleConfig.exclude
+
       // No need to scan for files if nothing should be included
       if (!(moduleConfig.include && moduleConfig.include.length === 0)) {
         let files = await this.getFiles({
           log,
-          path: moduleConfig.path,
-          pathDescription: "module root",
+          path,
+          pathDescription: `${description} root`,
           include: moduleConfig.include,
           exclude,
         })
@@ -187,7 +242,7 @@ export abstract class VcsHandler {
         result.files = files.map((f) => f.path)
       }
 
-      this.cache.set(log, cacheKey, result, getModuleCacheContext(moduleConfig))
+      this.cache.set(log, cacheKey, result, pathToCacheContext(path))
     })
 
     return result
@@ -209,6 +264,14 @@ export abstract class VcsHandler {
    */
   getRemoteSourceRelPath(name: string, url: string, sourceType: ExternalSourceType) {
     return getRemoteSourceRelPath({ name, url, sourceType })
+  }
+
+  /**
+   * Write a file and ensure relevant caches are invalidated after writing.
+   */
+  async writeFile(log: LogEntry, path: string, data: string | Buffer) {
+    await writeFile(path, data)
+    this.cache.invalidateUp(log, pathToCacheContext(path))
   }
 }
 
@@ -335,4 +398,16 @@ export function getModuleTreeCacheKey(moduleConfig: ModuleConfig) {
   }
 
   return cacheKey
+}
+
+export function getConfigFilePath(config: ModuleConfig) {
+  return config.configPath
+}
+
+export function getSourcePath(config: ModuleConfig) {
+  return config.path
+}
+
+export function describeConfig(config: ModuleConfig): ModuleDescription {
+  return `module ${config.name}`
 }

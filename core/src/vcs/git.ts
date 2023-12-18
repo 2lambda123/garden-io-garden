@@ -12,7 +12,7 @@ import { isAbsolute, join, posix, relative, resolve } from "path"
 import { flatten, isString } from "lodash"
 import { createReadStream, ensureDir, lstat, pathExists, readlink, realpath, stat, Stats } from "fs-extra"
 import { PassThrough, Transform } from "stream"
-import { GetFilesParams, RemoteSourceParams, VcsFile, VcsHandler, VcsInfo } from "./vcs"
+import { GetFilesParams, RemoteSourceParams, VcsFile, VcsHandler, VcsHandlerParams, VcsInfo } from "./vcs"
 import { ConfigurationError, RuntimeError } from "../exceptions"
 import Bluebird from "bluebird"
 import { getStatsType, joinWithPosix, matchPath } from "../util/fs"
@@ -84,8 +84,8 @@ export class GitHandler extends VcsHandler {
   private readonly gitSafeDirs: Set<string>
   private gitSafeDirsRead: boolean
 
-  constructor(...args: [string, string, string[], TreeCache]) {
-    super(...args)
+  constructor(params: VcsHandlerParams) {
+    super(params)
     this.profiler = getDefaultProfiler()
     this.gitSafeDirs = new Set<string>()
     this.gitSafeDirsRead = false
