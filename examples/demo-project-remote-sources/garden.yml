@@ -1,0 +1,15 @@
+# examples/remote-sources/garden.yml
+apiVersion: garden.io/v1
+kind: Project
+name: demo-project-remote-sources
+
+environments:
+  - name: local
+
+providers:
+  - name: local-kubernetes
+    environments: [local]
+
+sources:
+  - name: web-services
+    repositoryUrl: https://github.com/garden-io/demo-project-remote-sources.git#main
