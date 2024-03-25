@@ -1,5 +1,5 @@
 # examples/remote-sources/garden.yml
-apiVersion: garden.io/v1
+apiVersion: garden.io/v0
 kind: Project
 name: demo-project-remote-sources
 
@@ -12,4 +12,4 @@ providers:
 
 sources:
   - name: web-services
-    repositoryUrl: https://github.com/garden-io/demo-project-remote-sources.git#main
+    repositoryUrl: https://github.com/garden-io/demo-project-remote-sources.git#modules
