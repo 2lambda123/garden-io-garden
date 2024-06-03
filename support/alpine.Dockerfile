@@ -4,7 +4,7 @@ ARG VARIANT=root
 
 # NOTE: This is not the node version Garden itself will run in. Garden binaries have node "built in" and the version installed on the system does not matter.
 # The main reason we base these images off of the Node image is for Azure DevOps Support.
-FROM node:22.1.0-alpine@sha256:487dc5d5122d578e13f2231aa4ac0f63068becd921099c4c677c850df93bede8 as garden-base-root
+FROM node:22.2.0-alpine@sha256:3bb8914774985da457e08ca85654fecc062a206807d6225ede5b9b4e7465e733 as garden-base-root
 
 RUN apk add --no-cache \
   bash \
