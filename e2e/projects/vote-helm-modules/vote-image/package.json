@@ -10,7 +10,7 @@
     "test:integ": "node_modules/mocha/bin/_mocha tests/integ/test.js --timeout 30000"
   },
   "dependencies": {
-    "axios": "^0.28.0",
+    "axios": "^1.7.2",
     "chai": "^4.2.0",
     "core-js": "^3.6.5",
     "vue": "^2.7.14",
@@ -30,6 +30,6 @@
     "eslint": "^8.41.0",
     "eslint-plugin-vue": "^9.15.1",
     "mocha": "^10.2.0",
-    "vue-template-compiler": "^2.6.10"
+    "vue-template-compiler": "^2.7.16"
   }
 }
