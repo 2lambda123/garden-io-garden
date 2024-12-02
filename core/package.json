@@ -116,7 +116,7 @@
     "p-props": "^6.0.0",
     "p-queue": "^8.0.1",
     "p-retry": "^6.2.1",
-    "parse-duration": "^1.0.2",
+    "parse-duration": "^1.1.1",
     "parse-git-config": "^3.0.0",
     "path-is-inside": "^1.0.2",
     "pluralize": "^8.0.0",
