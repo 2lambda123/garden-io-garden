@@ -217,7 +217,7 @@
     "@types/tough-cookie": "^4.0.5",
     "@types/uniqid": "^5.3.4",
     "@types/unzip-stream": "^0.3.4",
-    "@types/uuid": "^9.0.8",
+    "@types/uuid": "^10.0.0",
     "@types/which": "^3.0.4",
     "@types/wrap-ansi": "^3.0.0",
     "@types/write-file-atomic": "^4.0.3",
