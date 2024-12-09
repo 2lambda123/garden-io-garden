@@ -61,7 +61,7 @@
     "npm-license-crawler": "^0.2.1",
     "prettier": "3.3.3",
     "replace-in-file": "^8.2.0",
-    "@rollup/wasm-node": "^4.22.4",
+    "@rollup/wasm-node": "^4.28.1",
     "semver": "^7.6.3",
     "shx": "^0.3.2",
     "split2": "^4.1.0",
