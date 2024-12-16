@@ -42,7 +42,7 @@
     "replace-in-file": "^8.2.0",
     "split2": "^4.1.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.5",
+    "typescript": "^5.7.2",
     "username": "^7.0.0"
   },
   "scripts": {
