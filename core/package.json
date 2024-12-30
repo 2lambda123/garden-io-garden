@@ -221,7 +221,7 @@
     "@types/which": "^3.0.4",
     "@types/wrap-ansi": "^3.0.0",
     "@types/write-file-atomic": "^4.0.3",
-    "@typescript-eslint/eslint-plugin": "^6.11.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
     "@typescript-eslint/parser": "^8.18.2",
     "chai": "^5.0.3",
     "eslint": "^9.15.0",
