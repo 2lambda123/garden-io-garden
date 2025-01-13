@@ -38,7 +38,7 @@
     "@opentelemetry/resources": "^1.30.0",
     "@opentelemetry/sdk-node": "^0.54.2",
     "@opentelemetry/sdk-trace-base": "^1.24.0",
-    "@opentelemetry/semantic-conventions": "^1.27.0",
+    "@opentelemetry/semantic-conventions": "^1.28.0",
     "@scg82/exit-hook": "^3.4.1",
     "@segment/analytics-node": "^2.2.0",
     "@types/ws": "^8.5.10",
