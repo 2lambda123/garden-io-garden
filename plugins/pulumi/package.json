@@ -18,7 +18,7 @@
   },
   "devDependencies": {
     "@types/chai": "^4.3.4",
-    "@types/hapi__joi": "^17.1.14",
+    "@types/hapi__joi": "^17.1.15",
     "@types/json-merge-patch": "1.0.0",
     "@types/mocha": "^10.0.9",
     "@types/node": "^22",
